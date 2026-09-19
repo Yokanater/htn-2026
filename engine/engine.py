@@ -1,7 +1,12 @@
-"""Qwen3 greedy decoding with fused norms and direct decoder-layer dispatch."""
+"""Qwen3 greedy decoding with fused norms, reusable KV storage and CUDA graphs."""
+
+import sys
+import time
 
 import torch
 from transformers import AutoModelForCausalLM, DynamicCache
+from decode import DecodeState
+from model_forward import qwen_forward
 
 
 class FusedRMSNorm(torch.nn.Module):
@@ -27,38 +32,6 @@ def install_fused_norms(model):
         layer.self_attn.k_norm = FusedRMSNorm(layer.self_attn.k_norm)
 
 
-@torch.inference_mode()
-def qwen_forward(model, input_ids, cache, first_position):
-    """Full unpadded prefill, or one decode token, using a dynamic cache.
-
-    SDPA supplies the causal mask for prefill. Single-token decode can attend
-    to the entire initialized cache. This path does not support chunked
-    prefill, padded batches, or a fixed-capacity cache.
-    """
-    base = model.model
-    x = base.embed_tokens(input_ids)
-    length = input_ids.shape[1]
-    cache_position = torch.arange(
-        first_position, first_position + length, device=input_ids.device
-    )
-    position_ids = cache_position.unsqueeze(0)
-    position_embeddings = base.rotary_emb(x, position_ids)
-    for layer in base.layers:
-        x = layer(
-            x,
-            attention_mask=None,
-            position_ids=position_ids,
-            past_key_value=cache,
-            use_cache=True,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-        )[0]
-
-    # No later operation uses the other prompt positions. Normalization is
-    # independent per token, so only normalize the position sent to the head.
-    return model.lm_head(base.norm(x[:, -1:, :]))
-
-
 class Engine:
     def __init__(self, model_path: str) -> None:
         """Load the pinned checkpoint from model_path. Untimed, budgeted."""
@@ -75,6 +48,7 @@ class Engine:
             .to("cuda:0")
         )
         install_fused_norms(self.model)
+        self._decode_state = None
 
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
         """Greedy continuation of every sequence, one step at a time.
@@ -86,9 +60,30 @@ class Engine:
         if max_new_tokens <= 0:
             return
         current = torch.tensor(input_ids, dtype=torch.int64, device=self.model.device)
-        cache = DynamicCache()
-        position = 0
         with torch.inference_mode():
+            if self.model.device.type == "cuda" and max_new_tokens > 1:
+                shape = (*current.shape, max_new_tokens)
+                state = getattr(self, "_decode_state", None)
+                if state is None or state.shape != shape:
+                    # Only one shape is live. The platform warms up each
+                    # workload in its own process before measured samples.
+                    self._decode_state = None
+                    state = None
+                    started = time.perf_counter()
+                    state = DecodeState(self.model, *shape)
+                    self._decode_state = state
+                    print(
+                        f"decode graph ready: batch/prompt/output={shape}, "
+                        f"setup={time.perf_counter() - started:.2f}s",
+                        file=sys.stderr,
+                    )
+                yield state.prefill(current)[:, 0].tolist()
+                for _ in range(max_new_tokens - 1):
+                    yield state.step()[:, 0].tolist()
+                return
+
+            cache = DynamicCache()
+            position = 0
             for _ in range(max_new_tokens):
                 logits = qwen_forward(self.model, current, cache, position)
                 position += current.shape[1]

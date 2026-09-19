@@ -10,6 +10,8 @@ from transformers import DynamicCache, Qwen3Config, Qwen3ForCausalLM
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 from engine import Engine, install_fused_norms, qwen_forward
+from decode import DecodeState, KVCache
+from model_forward import forward_at_positions
 
 
 def tiny_model(device="cpu", dtype=torch.float32):
@@ -76,6 +78,50 @@ class ForwardTests(unittest.TestCase):
             self.model.config.eos_token_id = expected[0][0]
             self.assertEqual(list(engine.generate(prompt, 6)), expected)
         self.assertEqual(list(engine.generate([[1]], 0)), [])
+
+    @torch.inference_mode()
+    def test_fixed_cache_logits_mask_unused_slots(self):
+        for batch, length, steps in ((1, 1, 2), (1, 7, 6), (4, 13, 5)):
+            with self.subTest(batch=batch, length=length):
+                capacity = length + steps - 1
+                cache = KVCache(self.model, batch, capacity)
+                for buffer in cache.key_cache + cache.value_cache:
+                    buffer.fill_(100)
+                native_cache = DynamicCache()
+                ids = torch.randint(0, 127, (batch, length))
+                position = 0
+                for step in range(steps):
+                    positions = torch.arange(position, position + ids.shape[1])
+                    mask = None if step == 0 else (
+                        torch.arange(capacity) <= position
+                    ).view(1, 1, 1, -1)
+                    expected = self.model(
+                        ids, past_key_values=native_cache, use_cache=True,
+                        logits_to_keep=1,
+                    ).logits
+                    actual = forward_at_positions(self.model, ids, cache, positions, mask)
+                    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+                    position += ids.shape[1]
+                    cache.prefilling = False
+                    ids = expected[:, -1].argmax(-1, keepdim=True)
+
+    @torch.inference_mode()
+    def test_decode_state_reuses_storage_and_resets_positions(self):
+        for batch, length, steps in ((1, 1, 2), (1, 7, 6), (4, 13, 5)):
+            state = DecodeState(self.model, batch, length, steps, capture=False)
+            pointers = [x.data_ptr() for x in state.cache.key_cache + state.cache.value_cache]
+            for _ in range(2):
+                prompt = torch.randint(0, 127, (batch, length))
+                expected = native_generate(self.model, prompt.tolist(), steps)
+                actual = [state.prefill(prompt)[:, 0].tolist()]
+                for _ in range(steps - 1):
+                    actual.append(state.step()[:, 0].tolist())
+                self.assertEqual(actual, expected)
+                self.assertEqual(state.position.item(), length + steps - 1)
+                self.assertEqual(
+                    pointers,
+                    [x.data_ptr() for x in state.cache.key_cache + state.cache.value_cache],
+                )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for Triton")

@@ -53,3 +53,28 @@ the fused-kernel checks. Full-model acceptance still requires Dryft evaluation.
 The next optimization to evaluate after this candidate is a preallocated KV
 cache followed by CUDA graph replay for single-token decode. It needs explicit
 masking of unused slots and in-place updates of graph inputs and positions.
+
+## 002 — Reusable KV cache and CUDA graph decode
+
+Target: exceed 520 tokens/sec on the benchmark. Treat that as an unverified
+target until a Dryft report supplies the measured workload or official score.
+
+Candidate 001 was pushed as `93dcbd6` to the connected default branch,
+`codex/solve-starter`, for public evaluation. No GitHub check or commit status
+was exposed when queried; a Dryft run/result or API token is still needed to
+read performance feedback. Do not infer that a push completed a GPU run.
+
+Candidate 002 retains native projections, RoPE, MLP, and SDPA while replacing
+dynamic cache concatenation with fixed per-layer K/V storage. Full prefill
+returns the native prompt K/V tensors to causal SDPA. Decode reads the fixed
+buffers with an explicit device-side mask permitting positions at or before
+the current write. The entire decode step, argmax, next-token copy, and position
+increment are captured as one CUDA graph. The host only replays and streams
+the resulting IDs. A single graph/cache state is retained for the current
+workload shape; setup occurs during the platform's untimed warmup.
+
+Six CPU tests pass, with two CUDA tests skipped locally. New tests compare
+fixed-cache logits against native through prefill and decode, deliberately
+poison unused slots, check buffer reuse, and verify position resets across
+different prompts. CUDA graph execution and full-checkpoint numerical
+acceptance remain unverified until an H100 run.
