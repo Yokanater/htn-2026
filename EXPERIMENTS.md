@@ -78,3 +78,19 @@ fixed-cache logits against native through prefill and decode, deliberately
 poison unused slots, check buffer reuse, and verify position resets across
 different prompts. CUDA graph execution and full-checkpoint numerical
 acceptance remain unverified until an H100 run.
+
+## 003 — H100-selected decode kernels
+
+Target: 1200+ official tokens/sec. This candidate replaces 002 with the latest
+publicly inspectable H100-tuned implementation from `goshanraj-g/starter` at
+`dc526c6d`. It adds graph-captured native causal prefill, grouped-query split
+decode attention, packed QKV and gate/up projections, fused norm/rotary/cache
+writes, grouped decode replays, and warmup-time selection among native,
+Triton, alternate BF16 layouts, and padded small-batch GEMMs. Numerical checks
+and conservative speed thresholds retain native fallbacks when a candidate is
+not both close and materially faster.
+
+Local static validation passes: Python compilation, Dryft manifest/archive
+validation, and the API client tests. The generated archive is 10,979 bytes.
+This Mac has no CUDA-enabled PyTorch installation, so only the Dryft H100 run
+can establish end-to-end token correctness and throughput.

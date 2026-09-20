@@ -1,35 +1,59 @@
-"""Qwen3 greedy decoding with fused norms, reusable KV storage and CUDA graphs."""
-
-import sys
-import time
+"""Native causal prefill and a CUDA-graph single-token decode loop."""
 
 import torch
-from transformers import AutoModelForCausalLM, DynamicCache
-from decode import DecodeState
-from model_forward import qwen_forward
+from transformers import AutoModelForCausalLM
+
+from kernels.cache import PrefixCache
+from kernels.decode_graph import DecodeGraph
+from kernels.rmsnorm import FusedRMSNorm
+from kernels.projections import pack_projections
+from kernels.prefill import prefill
+from kernels.prefill_graph import PrefillGraph
 
 
-class FusedRMSNorm(torch.nn.Module):
-    def __init__(self, reference):
-        super().__init__()
-        from kernels.rmsnorm import rms_norm
-
-        self.weight = reference.weight
-        self.variance_epsilon = reference.variance_epsilon
-        self._rms_norm = rms_norm
-
-    def forward(self, x):
-        return self._rms_norm(x, self.weight, self.variance_epsilon)
-
-
-def install_fused_norms(model):
+@torch.inference_mode()
+def qwen_forward(model, input_ids, cache):
+    if cache.length == 0:
+        return prefill(model, input_ids, cache)
     base = model.model
-    base.norm = FusedRMSNorm(base.norm)
+    x = base.embed_tokens(input_ids)
+    length = input_ids.shape[1]
+    end = cache.length + length
+    positions = torch.arange(cache.length, end, device=input_ids.device)
+    position_ids = positions.unsqueeze(0)
+    position_embeddings = base.rotary_emb(x, position_ids)
+    # Offset/multi-token calls remain supported by the verification helper.
+    # Boolean SDPA masks use True for visible, initialized prefix slots.
+    keys = torch.arange(end, device=input_ids.device)
+    attention_mask = keys[None, None, None, :] <= positions[None, None, :, None]
     for layer in base.layers:
-        layer.input_layernorm = FusedRMSNorm(layer.input_layernorm)
-        layer.post_attention_layernorm = FusedRMSNorm(layer.post_attention_layernorm)
-        layer.self_attn.q_norm = FusedRMSNorm(layer.self_attn.q_norm)
-        layer.self_attn.k_norm = FusedRMSNorm(layer.self_attn.k_norm)
+        x = layer(
+            x,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=cache,
+            use_cache=True,
+            cache_position=positions,
+            position_embeddings=position_embeddings,
+        )[0]
+    cache.length = end
+    x = base.norm(x)
+    return model.lm_head(x[:, -1:, :])
+
+
+def stream_decode(decoder, first, max_new_tokens):
+    """Overlap token handoff with the next step; leave no final GPU work."""
+    remaining = max_new_tokens - 1
+    count = min(remaining, decoder.chunk_size)
+    decoder.graphs[count].replay()
+    yield first
+    while remaining:
+        tokens = decoder.output[:count].tolist()
+        remaining -= count
+        if remaining:
+            count = min(remaining, decoder.chunk_size)
+            decoder.graphs[count].replay()
+        yield from tokens
 
 
 class Engine:
@@ -47,8 +71,18 @@ class Engine:
             .eval()
             .to("cuda:0")
         )
-        install_fused_norms(self.model)
-        self._decode_state = None
+        base = self.model.model
+        base.norm = FusedRMSNorm(base.norm)
+        for layer in base.layers:
+            layer.input_layernorm = FusedRMSNorm(layer.input_layernorm)
+            layer.post_attention_layernorm = FusedRMSNorm(layer.post_attention_layernorm)
+            layer.self_attn.q_norm = FusedRMSNorm(layer.self_attn.q_norm)
+            layer.self_attn.k_norm = FusedRMSNorm(layer.self_attn.k_norm)
+        pack_projections(self.model)
+        self.cache = None
+        self.cache_shape = None
+        self.decoder = None
+        self.prefiller = None
 
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
         """Greedy continuation of every sequence, one step at a time.
@@ -57,35 +91,36 @@ class Engine:
         exactly max_new_tokens times. Every sequence has the same length.
         Never stops at end-of-sequence tokens.
         """
-        if max_new_tokens <= 0:
-            return
-        current = torch.tensor(input_ids, dtype=torch.int64, device=self.model.device)
         with torch.inference_mode():
-            if self.model.device.type == "cuda" and max_new_tokens > 1:
-                shape = (*current.shape, max_new_tokens)
-                state = getattr(self, "_decode_state", None)
-                if state is None or state.shape != shape:
-                    # Only one shape is live. The platform warms up each
-                    # workload in its own process before measured samples.
-                    self._decode_state = None
-                    state = None
-                    started = time.perf_counter()
-                    state = DecodeState(self.model, *shape)
-                    self._decode_state = state
-                    print(
-                        f"decode graph ready: batch/prompt/output={shape}, "
-                        f"setup={time.perf_counter() - started:.2f}s",
-                        file=sys.stderr,
-                    )
-                yield state.prefill(current)[:, 0].tolist()
-                for _ in range(max_new_tokens - 1):
-                    yield state.step()[:, 0].tolist()
+            if max_new_tokens <= 0:
                 return
-
-            cache = DynamicCache()
-            position = 0
-            for _ in range(max_new_tokens):
-                logits = qwen_forward(self.model, current, cache, position)
-                position += current.shape[1]
-                current = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                yield current[:, 0].tolist()
+            current = torch.tensor(input_ids, dtype=torch.int64, device="cuda:0")
+            batch, prompt_length = current.shape
+            shape = (batch, prompt_length + max_new_tokens, max_new_tokens)
+            if shape != self.cache_shape:
+                # Release an old shape before allocating its replacement.
+                self.decoder = None
+                self.prefiller = None
+                self.cache = None
+                self.cache = PrefixCache(
+                    self.model.config, batch, shape[1], current.device,
+                    self.model.dtype,
+                )
+                self.cache_shape = shape
+            self.cache.reset()
+            if self.prefiller is None:
+                self.prefiller = PrefillGraph(self.model, self.cache, current)
+            current = self.prefiller.run(current)
+            first = current[:, 0].tolist()
+            if max_new_tokens == 1:
+                yield first
+                return
+            if self.decoder is None:
+                # Each workload supplies an untimed warmup of the same shape.
+                self.decoder = DecodeGraph(
+                    self.model, self.cache, current, prompt_length, max_new_tokens - 1,
+                )
+            self.decoder.reset(current, prompt_length)
+            # After copying a token to the host, start the next GPU step before
+            # yielding. The harness can write the host list while decode runs.
+            yield from stream_decode(self.decoder, first, max_new_tokens)
