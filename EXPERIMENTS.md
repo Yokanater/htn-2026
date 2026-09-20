@@ -108,3 +108,18 @@ tiles, fuses QKV and gate/up projections, uses fused epilogues for residuals
 and SwiGLU, captures prefill and decode graphs, and selects a split flash-decode
 kernel across the full static cache. Local Python compilation and Dryft archive
 validation pass; the H100 run remains the correctness and performance judge.
+
+Candidate 004 passed correctness and all gates but regressed to **767.0204
+tokens/sec** in run `23e88ed4-b470-450e-9289-a5a3589b93be`. Public throughput
+was 199.8 / 397.1 / 2382.7 tokens/sec with 19.68 GB peak memory. Do not retain.
+
+## 005 — Exact token-tree speculation
+
+Candidate 005 uses the tiered exact engine from `Pranoym17/starter` at
+`c4fca79a`. It adds prompt/ngram/Jacobi token-tree candidates and verifies them
+in a native-equivalent multi-token forward with ancestor masking, compacting
+only the accepted path. Speculation is enabled only after warmup validates its
+tokens and measures at least an 8% win; otherwise the engine falls back through
+its checked CUDA-graph decode tiers. The source reports a full Triton 3.1 sm_90
+compile sweep after fixing a Hopper 64-row compiler abort and int32 cache-offset
+overflow. Dryft archive validation and local Python compilation pass.
