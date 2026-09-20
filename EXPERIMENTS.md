@@ -130,3 +130,11 @@ Candidate 005 passed every gate at **909.5583 tokens/sec** in run
 disabled by default, while tree speculation is restricted to T5/T6. Candidate
 006 enables the exact T4-compatible verifier; its existing warmup teacher-force
 check and 8% speed threshold still fall back to plain decoding when unsuitable.
+
+Candidate 006 passed every gate at **902.9101 tokens/sec** in run
+`aaed3e88-0e0e-4fa6-a214-4332e30d8659`; prompt lookup remained neutral and is
+not the missing gain. Candidate 007 fixes an experiment-selection blind spot:
+plain T4 usually wins the tier comparison but cannot run token-tree verify, so
+the code never compares T5+tree against T4. Force the previously proven T5
+base for one run; tree activation remains teacher-force checked and requires
+an 8% measured warmup improvement.

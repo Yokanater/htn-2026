@@ -77,7 +77,7 @@ CHECK_STEPS = 32          # self-check length (tokens) on the warmup prompt
 CHECK_ROWS = 4            # rows run through the native loop for the divergence report
 MARGIN_LIMIT = 1.0        # native's own drift is <= 0.75; the judge's margin is 2.0
 PREFILL_TOKENS = 16384    # prefill processes at most this many tokens per row-chunk
-FORCE_TIER = int(os.environ.get("ENGINE_TIER", "-1"))
+FORCE_TIER = int(os.environ.get("ENGINE_TIER", "5"))
 SPEC = os.environ.get("ENGINE_SPEC", "1") != "0"   # exact prompt/ngram verification; warmup-gated
 SPEC_MAX_ROWS = 64        # verify runs B*(k+1) rows through the skinny GEMMs
 SPEC_CHECK_TOKENS = 128   # warmup tokens used to validate and time speculative decoding
