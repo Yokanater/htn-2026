@@ -123,3 +123,10 @@ tokens and measures at least an 8% win; otherwise the engine falls back through
 its checked CUDA-graph decode tiers. The source reports a full Triton 3.1 sm_90
 compile sweep after fixing a Hopper 64-row compiler abort and int32 cache-offset
 overflow. Dryft archive validation and local Python compilation pass.
+
+Candidate 005 passed every gate at **909.5583 tokens/sec** in run
+`bc3b0cb5-6214-4621-b4f0-9609de780048`, with public throughput 233.6 / 468.9 /
+2818.7 tokens/sec. Inspection showed prompt/ngram speculation was compiled but
+disabled by default, while tree speculation is restricted to T5/T6. Candidate
+006 enables the exact T4-compatible verifier; its existing warmup teacher-force
+check and 8% speed threshold still fall back to plain decoding when unsuitable.
