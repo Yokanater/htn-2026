@@ -94,3 +94,17 @@ Local static validation passes: Python compilation, Dryft manifest/archive
 validation, and the API client tests. The generated archive is 10,979 bytes.
 This Mac has no CUDA-enabled PyTorch installation, so only the Dryft H100 run
 can establish end-to-end token correctness and throughput.
+
+Candidate 003 passed every official workload at **888.8163 tokens/sec** in run
+`4797cd69-6101-4db0-866e-73ac9405aad4`. Public throughput was 229.8 / 457.0 /
+2790.9 tokens/sec with 16.55 GB peak memory. Correctness, latency, memory, and
+stability all passed; hidden-shape decode throughput remains the limiter.
+
+## 004 — Split-K GEMMs and fused flash decode
+
+Candidate 004 moves to the more aggressive public H100 implementation from
+`RajanChavada/starter` at `d733ea92`. It warmup-selects wider split-K GEMM
+tiles, fuses QKV and gate/up projections, uses fused epilogues for residuals
+and SwiGLU, captures prefill and decode graphs, and selects a split flash-decode
+kernel across the full static cache. Local Python compilation and Dryft archive
+validation pass; the H100 run remains the correctness and performance judge.

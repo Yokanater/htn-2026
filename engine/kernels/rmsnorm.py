@@ -1,4 +1,13 @@
-"""Qwen3 RMSNorm with the reference's BF16 rounding boundary preserved."""
+"""Qwen3's RMSNorm in Triton, written to match the reference exactly.
+
+Nothing imports this. It is here to demonstrate the two things the baseline
+never shows: how a module beside ``engine.py`` is vendored and imported, and how
+closely a fused kernel has to follow the reference's arithmetic to stay inside
+the tie margin.
+
+To use it, swap it in for the ``Qwen3RMSNorm`` modules on the loaded model in
+``Engine.__init__``. Delete this package if you would rather start clean.
+"""
 
 import torch
 import triton
@@ -60,13 +69,3 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
         num_warps=max(4, min(16, block // 256)),
     )
     return out.reshape(shape)
-
-
-class FusedRMSNorm(torch.nn.Module):
-    def __init__(self, reference):
-        super().__init__()
-        self.weight = reference.weight
-        self.variance_epsilon = reference.variance_epsilon
-
-    def forward(self, x):
-        return rms_norm(x, self.weight, self.variance_epsilon)

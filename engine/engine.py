@@ -1,59 +1,95 @@
-"""Native causal prefill and a CUDA-graph single-token decode loop."""
+"""Qwen3 4B decode engine: static KV cache and a CUDA-graphed decode step.
+
+The arithmetic reproduces ``Qwen3DecoderLayer.forward`` from Transformers
+4.51.3 operation for operation, reusing the loaded modules. What changes is the
+plumbing: a preallocated cache instead of ``DynamicCache``, a direct layer walk
+instead of ``Qwen3ForCausalLM.__call__``, and one captured CUDA graph for the
+``T=1`` step instead of full Python dispatch per token.
+
+Prefill stays eager. It runs once per sample, its shape differs from decode,
+and it is compute-bound rather than dispatch-bound.
+"""
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
-from kernels.cache import PrefixCache
-from kernels.decode_graph import DecodeGraph
-from kernels.rmsnorm import FusedRMSNorm
-from kernels.projections import pack_projections
-from kernels.prefill import prefill
-from kernels.prefill_graph import PrefillGraph
+from kernels import elementwise, gemm
+from kernels import flash_decode as flash_decode_module
+from kernels.flash_decode import BLOCK_M, choose_splits, flash_decode
+from kernels.qkv import qkv_finish
+from kernels.rmsnorm import rms_norm
+
+DEVICE = "cuda:0"
+
+#: Decode steps run between device syncs. Each yield must still be one step,
+#: but nothing requires one D2H copy per step, and the copy costs a stall.
+SYNC_CHUNK = 1024
+
+#: Tolerance for accepting a custom GEMM against cuBLAS. Both accumulate in
+#: fp32 and round once, so a correct kernel lands far inside this.
+GEMM_ATOL = 0.05
+GEMM_RTOL = 0.005
+
+#: Key block for the decode kernel's inner loop.
+DECODE_BLOCK_N = 64
+
+#: The challenge spec's own tolerance, reused to gate the custom kernel.
+CHECK_ATOL = 0.02
+CHECK_RTOL = 0.02
+
+#: One-line kill switch if a captured graph turns out to be what breaks a run.
+USE_CUDA_GRAPH = True
+
+#: Replays before capture, so cuBLAS and SDPA settle on their algorithms and
+#: any lazy allocation happens outside the graph.
+CAPTURE_WARMUP_STEPS = 3
+
+#: The 19,456-wide gate/up projection is half of every layer's streamed
+#: weights.  A 256-wide tile yields just 76 blocks at batch 1, leaving H100
+#: SMs idle.  This 64-wide plan launches 304 blocks and is deliberately fixed
+#: so warmup jitter cannot select the under-filled variant for a whole run.
+PINNED_GATEUP_CONFIG = (64, 128, 4, 4)
 
 
-@torch.inference_mode()
-def qwen_forward(model, input_ids, cache):
-    if cache.length == 0:
-        return prefill(model, input_ids, cache)
-    base = model.model
-    x = base.embed_tokens(input_ids)
-    length = input_ids.shape[1]
-    end = cache.length + length
-    positions = torch.arange(cache.length, end, device=input_ids.device)
-    position_ids = positions.unsqueeze(0)
-    position_embeddings = base.rotary_emb(x, position_ids)
-    # Offset/multi-token calls remain supported by the verification helper.
-    # Boolean SDPA masks use True for visible, initialized prefix slots.
-    keys = torch.arange(end, device=input_ids.device)
-    attention_mask = keys[None, None, None, :] <= positions[None, None, :, None]
-    for layer in base.layers:
-        x = layer(
-            x,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=cache,
-            use_cache=True,
-            cache_position=positions,
-            position_embeddings=position_embeddings,
-        )[0]
-    cache.length = end
-    x = base.norm(x)
-    return model.lm_head(x[:, -1:, :])
+def _log(message: str) -> None:
+    """Diagnostics for the run log's bounded tail.
+
+    Only ever called from load and warmup; a measured step prints nothing.
+    """
+    print(f"[engine] {message}", flush=True)
 
 
-def stream_decode(decoder, first, max_new_tokens):
-    """Overlap token handoff with the next step; leave no final GPU work."""
-    remaining = max_new_tokens - 1
-    count = min(remaining, decoder.chunk_size)
-    decoder.graphs[count].replay()
-    yield first
-    while remaining:
-        tokens = decoder.output[:count].tolist()
-        remaining -= count
-        if remaining:
-            count = min(remaining, decoder.chunk_size)
-            decoder.graphs[count].replay()
-        yield from tokens
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def _torch_linear(weight, x):
+    return F.linear(x, weight)
+
+
+def _time_ms(call, iterations: int = 25, bursts: int = 3) -> float:
+    """Device time for a launch, used only during warmup.
+
+    The fastest of several bursts: a clock ramp or a neighbour's interference
+    inflates one burst, and a single inflated reading would pin a slower
+    configuration for the whole run.
+    """
+    for _ in range(5):
+        call()
+    torch.cuda.synchronize()
+    best = float("inf")
+    for _ in range(bursts):
+        start = torch.cuda.Event(enable_timing=True)
+        stop = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iterations):
+            call()
+        stop.record()
+        torch.cuda.synchronize()
+        best = min(best, start.elapsed_time(stop) / iterations)
+    return best
 
 
 class Engine:
@@ -61,6 +97,7 @@ class Engine:
         """Load the pinned checkpoint from model_path. Untimed, budgeted."""
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
+
         self.model = (
             AutoModelForCausalLM.from_pretrained(
                 model_path,
@@ -69,58 +106,917 @@ class Engine:
                 local_files_only=True,
             )
             .eval()
-            .to("cuda:0")
+            .to(DEVICE)
         )
+
         base = self.model.model
-        base.norm = FusedRMSNorm(base.norm)
-        for layer in base.layers:
-            layer.input_layernorm = FusedRMSNorm(layer.input_layernorm)
-            layer.post_attention_layernorm = FusedRMSNorm(layer.post_attention_layernorm)
-            layer.self_attn.q_norm = FusedRMSNorm(layer.self_attn.q_norm)
-            layer.self_attn.k_norm = FusedRMSNorm(layer.self_attn.k_norm)
-        pack_projections(self.model)
-        self.cache = None
-        self.cache_shape = None
-        self.decoder = None
-        self.prefiller = None
+        config = self.model.config
+        self.base = base
+        self.layers = base.layers
+        self.n_layers = len(base.layers)
+        self.n_kv_heads = config.num_key_value_heads
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.kv_groups = config.num_attention_heads // self.n_kv_heads
+        self.scaling = self.head_dim**-0.5
+
+        self._fuse_projections()
+
+        self._gemm_plan = {}
+        self._fused_norm = False
+        self._fused_rope = False
+        self._fused_swiglu = False
+        self._fused_qkv = False
+        self._gemm_norm = False
+        self._gemm_activate = False
+        self._batch = 0
+        self._capacity = 0
+        self._graph = None
+        self._graph_shape = None
+        self._warmed = False
+        self.k_cache = []
+        self.v_cache = []
+        _log(
+            f"loaded layers={self.n_layers} kv_heads={self.n_kv_heads} "
+            f"groups={self.kv_groups} head_dim={self.head_dim} "
+            f"weights={torch.cuda.memory_allocated() / 2**30:.2f}GiB"
+        )
+
+    # ---------------------------------------------------------------- setup
+
+    @torch.no_grad()
+    def _fuse_projections(self) -> None:
+        """Concatenate q/k/v and gate/up into single weights.
+
+        Decode is bound by streaming 8 GB of weights per step, and a matmul
+        with one row reaches only a fraction of peak bandwidth, so the seven
+        projections per layer become four larger ones. Each output element is
+        still the same dot product over the same inputs; only the tiling
+        cuBLAS chooses differs, which is a reordering.
+
+        The originals stay resident. Removing them from the module tree is the
+        riskiest part of this change and buys only memory we are not short of;
+        nothing reads them, so they cost capacity, not bandwidth.
+        """
+        attn = self.layers[0].self_attn
+        self.q_size = attn.q_proj.weight.shape[0]
+        self.kv_size = attn.k_proj.weight.shape[0]
+        self.mlp_size = self.layers[0].mlp.gate_proj.weight.shape[0]
+
+        for layer in self.layers:
+            attn = layer.self_attn
+            attn.qkv_weight = torch.cat(
+                [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight], dim=0
+            )
+            mlp = layer.mlp
+            mlp.gateup_weight = torch.cat(
+                [mlp.gate_proj.weight, mlp.up_proj.weight], dim=0
+            )
+
+        torch.cuda.empty_cache()
+        _log(
+            f"fused projections qkv={self.q_size + 2 * self.kv_size} "
+            f"gateup={2 * self.mlp_size} "
+            f"weights={torch.cuda.memory_allocated() / 2**30:.2f}GiB"
+        )
+
+    def _mlp(self, layer, hidden, fast: bool = False, residual=None, norm=None):
+        linear = self._fast_linear if fast else _torch_linear
+        if fast:
+            gate_up = self._fast_linear(layer.mlp.gateup_weight, hidden, norm=norm)
+            if self._gemm_activate:
+                return self._fast_linear(
+                    layer.mlp.down_proj.weight, gate_up, residual=residual, activate=True
+                )
+        else:
+            if norm is not None:
+                hidden = self._norm(norm, hidden)
+            gate_up = linear(layer.mlp.gateup_weight, hidden)
+        if self._fused_swiglu:
+            activated = elementwise.swiglu(gate_up)
+        else:
+            activated = (
+                F.silu(gate_up[..., : self.mlp_size]) * gate_up[..., self.mlp_size :]
+            )
+        if fast:
+            return self._fast_linear(
+                layer.mlp.down_proj.weight, activated, residual=residual
+            )
+        out = F.linear(activated, layer.mlp.down_proj.weight)
+        return out if residual is None else residual + out
+
+    # ---------------------------------------------------------------- fusions
+
+    def _norm(self, module, x):
+        if self._fused_norm:
+            return rms_norm(x, module.weight, module.variance_epsilon)
+        return module(x)
+
+    @staticmethod
+    def _agrees(got, want) -> bool:
+        gap = (got.float() - want.float()).abs().max().item()
+        return gap <= CHECK_ATOL + CHECK_RTOL * want.float().abs().max().item()
+
+    def _plan_fusions(self, batch: int) -> None:
+        """Adopt each fused kernel only if it reproduces the module it replaces.
+
+        Every fusion is checked separately, so one bad kernel costs its own
+        launches rather than the whole set.
+        """
+        self._fused_norm = self._check(self._try_norm)
+        self._fused_rope = self._check(lambda: self._try_rope(batch))
+        self._fused_swiglu = self._check(lambda: self._try_swiglu(batch))
+        self._fused_qkv = self._check(lambda: self._try_qkv(batch))
+        self._gemm_norm = self._check(lambda: self._try_gemm_norm(batch))
+        self._gemm_activate = self._check(lambda: self._try_gemm_activate(batch))
+        _log(
+            f"fusions norm={self._fused_norm} rope={self._fused_rope} "
+            f"swiglu={self._fused_swiglu} qkv={self._fused_qkv} "
+            f"gemm_norm={self._gemm_norm} gemm_activate={self._gemm_activate}"
+        )
+
+    def _try_gemm_activate(self, batch: int) -> bool:
+        """The SwiGLU-on-load down projection must match SwiGLU then GEMM.
+
+        Both round at the same points and feed the same kernel, so the check
+        is for equality, and it must also not be slower than the pair.
+        """
+        weight = self.layers[0].mlp.down_proj.weight
+        config = self._gemm_plan.get(tuple(weight.shape))
+        if config is None or not self._fused_swiglu:
+            return False
+        gate_up = torch.randn(
+            (batch, 2 * self.mlp_size), device=DEVICE, dtype=torch.bfloat16
+        )
+        residual = torch.randn((batch, weight.shape[0]), device=DEVICE, dtype=torch.bfloat16)
+        fused = torch.empty_like(residual)
+        plain = torch.empty_like(residual)
+
+        def two_launch():
+            gemm.run(gate_up, weight, plain, config, residual=residual)
+            elementwise.swiglu(gate_up)
+
+        for _ in range(8):
+            gate_up.normal_()
+            gemm.run(gate_up, weight, fused, config, residual=residual, activate=True)
+            gemm.run(elementwise.swiglu(gate_up), weight, plain, config, residual=residual)
+            torch.cuda.synchronize()
+            if not torch.equal(fused, plain):
+                return False
+        one = _time_ms(
+            lambda: gemm.run(gate_up, weight, fused, config, residual=residual, activate=True)
+        )
+        two = _time_ms(two_launch)
+        _log(f"down_proj swiglu-on-load {one * 1000:.0f}us vs two launches {two * 1000:.0f}us")
+        return one <= two
+
+    def _try_gemm_norm(self, batch: int) -> bool:
+        """Check the GEMM's fused RMSNorm against norm-then-matmul.
+
+        Checked on both shapes that use it: the 2560-wide hidden state into
+        the QKV weight, and the same into gate/up.
+        """
+        for weight, norm in (
+            (self.layers[0].self_attn.qkv_weight, self.layers[0].input_layernorm),
+            (self.layers[0].mlp.gateup_weight, self.layers[0].post_attention_layernorm),
+        ):
+            config = self._gemm_plan.get(tuple(weight.shape))
+            if config is None:
+                return False
+            x = torch.randn(
+                (batch, weight.shape[1]), device=DEVICE, dtype=torch.bfloat16
+            )
+            out = torch.empty(
+                (batch, weight.shape[0]), device=DEVICE, dtype=torch.bfloat16
+            )
+            gemm.run(
+                x, weight, out, config,
+                gain=norm.weight, eps=norm.variance_epsilon,
+            )
+            torch.cuda.synchronize()
+            if not self._agrees(out, F.linear(norm(x), weight)):
+                return False
+        return True
+
+    def _try_qkv(self, batch: int) -> bool:
+        attn = self.layers[0].self_attn
+        capacity = self._capacity
+        position = min(5, capacity - 1)
+        width = self.q_size + 2 * self.kv_size
+        head_shape = (batch, self.n_kv_heads, self.kv_groups, self.head_dim)
+        cache_shape = (batch, self.n_kv_heads, capacity, self.head_dim)
+
+        qkv = torch.randn((batch, width), device=DEVICE, dtype=torch.bfloat16)
+        slot = torch.tensor([position], dtype=torch.int64, device=DEVICE)
+        keys = torch.zeros(cache_shape, dtype=torch.bfloat16, device=DEVICE)
+        values = torch.zeros_like(keys)
+        query = torch.empty(head_shape, dtype=torch.bfloat16, device=DEVICE)
+        qkv_finish(
+            qkv, attn.q_norm.weight, attn.k_norm.weight,
+            self.cos_table, self.sin_table, slot,
+            query, keys, values, attn.q_norm.variance_epsilon,
+        )
+
+        q_end = self.q_size
+        k_end = q_end + self.kv_size
+        cos = self.cos_table[position].view(1, 1, 1, self.head_dim)
+        sin = self.sin_table[position].view(1, 1, 1, self.head_dim)
+        want_q = attn.q_norm(
+            qkv[:, :q_end].reshape(batch, 1, -1, self.head_dim)
+        ).view(head_shape)
+        want_k = attn.k_norm(
+            qkv[:, q_end:k_end].reshape(batch, 1, -1, self.head_dim)
+        ).view(batch, self.n_kv_heads, 1, self.head_dim)
+        want_v = qkv[:, k_end:].reshape(batch, self.n_kv_heads, 1, self.head_dim)
+        want_q = (want_q * cos) + (_rotate_half(want_q) * sin)
+        want_k = (want_k * cos) + (_rotate_half(want_k) * sin)
+
+        return (
+            self._agrees(query, want_q)
+            and self._agrees(keys[:, :, position, :], want_k[:, :, 0, :])
+            and self._agrees(values[:, :, position, :], want_v[:, :, 0, :])
+        )
+
+    @staticmethod
+    def _check(attempt) -> bool:
+        try:
+            return bool(attempt())
+        except Exception as error:  # noqa: BLE001 - unusable kernel, not a failure
+            _log(f"fusion unusable: {type(error).__name__}: {error}")
+            return False
+
+    def _try_norm(self) -> bool:
+        # Both widths the model norms over: the hidden state and one head.
+        for module in (self.layers[0].input_layernorm, self.layers[0].self_attn.q_norm):
+            width = module.weight.shape[0]
+            x = torch.randn((16, width), device=DEVICE, dtype=torch.bfloat16)
+            if not self._agrees(
+                rms_norm(x, module.weight, module.variance_epsilon), module(x)
+            ):
+                return False
+        return True
+
+    def _try_rope(self, batch: int) -> bool:
+        shape = (batch, self.n_kv_heads, self.kv_groups, self.head_dim)
+        x = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
+        cos = self.cos_table[3]
+        sin = self.sin_table[3]
+        wide = cos.view(1, 1, 1, self.head_dim)
+        want = (x * wide) + (_rotate_half(x) * sin.view(1, 1, 1, self.head_dim))
+        return self._agrees(elementwise.rope(x, cos, sin), want)
+
+    def _try_swiglu(self, batch: int) -> bool:
+        x = torch.randn(
+            (batch, 1, 2 * self.mlp_size), device=DEVICE, dtype=torch.bfloat16
+        )
+        want = F.silu(x[..., : self.mlp_size]) * x[..., self.mlp_size :]
+        return self._agrees(elementwise.swiglu(x), want)
+
+    # ------------------------------------------------------------ projections
+
+    def _fast_linear(self, weight, x, residual=None, norm=None, activate=False):
+        """Decode-path matmul, using whichever of cuBLAS or Triton won at warmup.
+
+        ``residual`` and ``norm`` are folded into the kernel when the custom
+        path is active, removing one launch each per layer. Either falls back
+        to its own launch if the fused form was not adopted at warmup.
+        """
+        config = self._gemm_plan.get(tuple(weight.shape))
+        fused_norm = norm is not None and config is not None and self._gemm_norm
+        if norm is not None and not fused_norm:
+            x = self._norm(norm, x)
+        if config is None:
+            out = F.linear(x, weight)
+            return out if residual is None else residual + out
+        rows = x.shape[0]
+        out = torch.empty((rows, weight.shape[0]), dtype=x.dtype, device=x.device)
+        gemm.run(
+            x.reshape(rows, -1),
+            weight,
+            out,
+            config,
+            residual=None if residual is None else residual.reshape(rows, -1),
+            gain=norm.weight if fused_norm else None,
+            eps=norm.variance_epsilon if fused_norm else 0.0,
+            activate=activate,
+        )
+        return out.view(rows, 1, -1)
+
+    def _plan_gemms(self, batch: int) -> None:
+        """Benchmark every projection shape, cuBLAS against each Triton config.
+
+        Warmup is untimed, so this is a free, workload-specific autotune. It
+        keeps cuBLAS unless a configuration is both correct and faster, which
+        makes adopting the custom kernel incapable of regressing the step.
+        """
+        self._gemm_plan = {}
+        first = self.layers[0]
+        self._verify_split_fixup(first.mlp.down_proj.weight, batch)
+        for weight in (
+            first.self_attn.qkv_weight,
+            first.self_attn.o_proj.weight,
+            first.mlp.gateup_weight,
+            first.mlp.down_proj.weight,
+            self.model.lm_head.weight,
+        ):
+            key = tuple(weight.shape)
+            if key not in self._gemm_plan:
+                self._gemm_plan[key] = self._choose_gemm(weight, batch)
+
+    def _verify_split_fixup(self, weight, batch: int) -> None:
+        """Exercise the single-launch split-K path against the two-launch one.
+
+        The fixup relies on cross-program ordering, which a single check
+        cannot prove, so it is replayed many times with fresh inputs; one
+        disagreement falls back to the separate reduction for the whole run.
+        """
+        if not gemm.SPLIT_FIXUP:
+            return
+        rows, columns = weight.shape
+        try:
+            x = torch.randn((batch, columns), device=DEVICE, dtype=torch.bfloat16)
+            residual = torch.randn((batch, rows), device=DEVICE, dtype=torch.bfloat16)
+            fused = torch.empty_like(residual)
+            plain = torch.empty_like(residual)
+            for trial in range(64):
+                x.normal_()
+                residual.normal_()
+                config = gemm.SPLIT_CONFIGS[trial % len(gemm.SPLIT_CONFIGS)]
+                gemm.SPLIT_FIXUP = True
+                gemm.run(x, weight, fused, config, residual=residual)
+                gemm.SPLIT_FIXUP = False
+                gemm.run(x, weight, plain, config, residual=residual)
+                gemm.SPLIT_FIXUP = True
+                torch.cuda.synchronize()
+                if not torch.equal(fused, plain):
+                    raise RuntimeError(f"mismatch on trial {trial} config {config}")
+            _log("split-k fixup verified bit-identical to the two-launch reduction")
+        except Exception as error:  # noqa: BLE001 - keep the proven path
+            gemm.SPLIT_FIXUP = False
+            _log(f"split-k fixup disabled: {type(error).__name__}: {error}")
+
+    def _choose_gemm(self, weight, batch: int):
+        rows, columns = weight.shape
+        try:
+            x = torch.randn((batch, columns), device=DEVICE, dtype=torch.bfloat16)
+            out = torch.empty((batch, rows), device=DEVICE, dtype=torch.bfloat16)
+            reference = F.linear(x, weight)
+            baseline = _time_ms(lambda: F.linear(x, weight))
+            allowed = GEMM_ATOL + GEMM_RTOL * reference.float().abs().max().item()
+        except Exception as error:  # noqa: BLE001
+            _log(f"gemm plan skipped [{rows}x{columns}]: {type(error).__name__}")
+            return None
+
+        if rows == 2 * self.mlp_size:
+            # This is the dominant projection.  Pin a tile count that fills
+            # H100 instead of letting microsecond-scale warmup noise choose a
+            # low-occupancy shape.  A compile or numerical miss falls through
+            # to the existing cuBLAS-vs-Triton planner.
+            try:
+                gemm.run(x, weight, out, PINNED_GATEUP_CONFIG)
+                torch.cuda.synchronize()
+                gap = (out.float() - reference.float()).abs().max().item()
+                if gap <= allowed and self._residual_agrees(
+                    PINNED_GATEUP_CONFIG, x, weight, out
+                ):
+                    _log(
+                        f"gemm [{rows}x{columns}] pinned={PINNED_GATEUP_CONFIG} "
+                        f"cublas={baseline * 1000:.0f}us"
+                    )
+                    return PINNED_GATEUP_CONFIG
+            except Exception as error:  # noqa: BLE001 - retain the planner
+                _log(f"gateup pin unavailable: {type(error).__name__}")
+
+        candidates = gemm.CONFIGS
+        if rows <= gemm.SPLIT_MAX_N:
+            # Narrow outputs cannot fill the device by tiling N alone.
+            candidates = candidates + gemm.SPLIT_CONFIGS
+
+        best, best_ms = None, baseline
+        for config in candidates:
+            try:
+                gemm.run(x, weight, out, config)
+                torch.cuda.synchronize()
+                gap = (out.float() - reference.float()).abs().max().item()
+                if not gap <= allowed:
+                    continue
+                elapsed = _time_ms(lambda: gemm.run(x, weight, out, config))
+            except Exception:  # noqa: BLE001 - a bad config is just not chosen
+                continue
+            if elapsed < best_ms:
+                best, best_ms = config, elapsed
+
+        if best is not None and not self._residual_agrees(best, x, weight, out):
+            _log(f"gemm [{rows}x{columns}] residual epilogue wrong, keeping cublas")
+            best = None
+        _log(
+            f"gemm [{rows}x{columns}] cublas={baseline * 1000:.0f}us "
+            f"chosen={best} at {best_ms * 1000:.0f}us"
+        )
+        return best
+
+    def _residual_agrees(self, config, x, weight, out) -> bool:
+        """The epilogue is a separate code path, so check it separately."""
+        try:
+            residual = torch.randn(
+                (x.shape[0], weight.shape[0]), device=DEVICE, dtype=torch.bfloat16
+            )
+            want = residual + F.linear(x, weight)
+            gemm.run(x, weight, out, config, residual=residual)
+            torch.cuda.synchronize()
+            return self._agrees(out, want)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _build_rope_tables(self, capacity: int) -> None:
+        """Tabulate per-position cos/sin.
+
+        ``Qwen3RotaryEmbedding.forward`` builds these from a K=1 outer product,
+        so a per-position table holds the same values rather than an
+        approximation of them. Trig in fp32, cast once at the end, as there.
+        """
+        rotary = self.base.rotary_emb
+        inv_freq = rotary.inv_freq.to(DEVICE, torch.float32)
+        positions = torch.arange(capacity, device=DEVICE, dtype=torch.float32)
+        emb = torch.cat((torch.outer(positions, inv_freq),) * 2, dim=-1)
+        self.cos_table = (emb.cos() * rotary.attention_scaling).to(torch.bfloat16)
+        self.sin_table = (emb.sin() * rotary.attention_scaling).to(torch.bfloat16)
+
+    def _allocate(self, batch: int, capacity: int) -> None:
+        """Allocate everything that depends on the workload shape.
+
+        Driven by the harness's warmup call, which has the same shape as the
+        measured samples, so no sample pays allocation or capture.
+        """
+        self._batch = batch
+        self._capacity = capacity
+        self._build_rope_tables(capacity)
+
+        shape = (batch, self.n_kv_heads, capacity, self.head_dim)
+        self.k_cache = [
+            torch.zeros(shape, dtype=torch.bfloat16, device=DEVICE)
+            for _ in range(self.n_layers)
+        ]
+        self.v_cache = [
+            torch.zeros(shape, dtype=torch.bfloat16, device=DEVICE)
+            for _ in range(self.n_layers)
+        ]
+
+        self.slots = torch.arange(capacity, device=DEVICE, dtype=torch.int64)
+        self._full_len = torch.tensor([capacity], dtype=torch.int64, device=DEVICE)
+        # Fixed addresses the captured graph reads from and writes to.
+        self.cur_pos = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+        self.valid_len = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+        self.step_token = torch.zeros((batch, 1), dtype=torch.int64, device=DEVICE)
+        self.next_token = torch.zeros((batch, 1), dtype=torch.int64, device=DEVICE)
+        self.step_idx = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+        self.token_log = torch.zeros(
+            (capacity, batch), dtype=torch.int64, device=DEVICE
+        )
+
+        self._plan_gemms(batch)
+        self._plan_fusions(batch)
+
+        self.attn_out = torch.zeros(
+            (batch, self.n_kv_heads, self.kv_groups, self.head_dim),
+            dtype=torch.bfloat16,
+            device=DEVICE,
+        )
+        self._plan_attention()
+
+        self._graph = None
+        self._graph_shape = None
+        self._prefill_graph = None
+        self._prefill_shape = None
+
+    def _attention_buffers(self, splits: int):
+        heads = self._batch * self.n_kv_heads
+        acc = torch.zeros(
+            (heads, splits, BLOCK_M, self.head_dim),
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+        stats = torch.zeros((heads, splits, BLOCK_M), dtype=torch.float32, device=DEVICE)
+        return acc, stats, torch.zeros_like(stats)
+
+    def _plan_attention(self) -> None:
+        """Pick the faster of SDPA and the split-K kernel, and its tiling.
+
+        Same discipline as the GEMM plan: the custom kernel has to earn its
+        place against the reference on this workload's actual shapes, so a
+        kernel that is correct but slow is simply not used.
+        """
+        batch, capacity = self._batch, self._capacity
+        heads = batch * self.n_kv_heads
+        self.splits, self.block_n = choose_splits(heads, capacity, DECODE_BLOCK_N), DECODE_BLOCK_N
+        self.acc_buf, self.max_buf, self.sum_buf = self._attention_buffers(self.splits)
+        self.use_triton_attn = False
+
+        try:
+            shape = (batch, self.n_kv_heads, self.kv_groups, self.head_dim)
+            cache_shape = (batch, self.n_kv_heads, capacity, self.head_dim)
+            generator = torch.Generator(device=DEVICE).manual_seed(0)
+            query = torch.randn(shape, generator=generator, device=DEVICE, dtype=torch.bfloat16)
+            keys = torch.randn(cache_shape, generator=generator, device=DEVICE, dtype=torch.bfloat16)
+            values = torch.randn(cache_shape, generator=generator, device=DEVICE, dtype=torch.bfloat16)
+            probe = torch.empty_like(query)
+            mask = (self.slots < capacity).view(1, 1, 1, capacity)
+            baseline = _time_ms(
+                lambda: F.scaled_dot_product_attention(
+                    query, keys, values, attn_mask=mask, scale=self.scaling
+                )
+            )
+        except Exception as error:  # noqa: BLE001
+            _log(f"attention plan skipped: {type(error).__name__}: {error}")
+            return
+
+        self._verify_attention_fixup(query, keys, values, probe)
+
+        best, best_ms = None, baseline
+        seen = set()
+        for block_n in (32, 64, 128):
+            ceiling = choose_splits(heads, capacity, block_n)
+            for splits in {ceiling, max(1, ceiling // 2), max(1, ceiling // 4)}:
+                if (block_n, splits) in seen:
+                    continue
+                seen.add((block_n, splits))
+                try:
+                    buffers = self._attention_buffers(splits)
+                    if not self._attention_agrees(
+                        query, keys, values, probe, buffers, splits, block_n
+                    ):
+                        continue
+                    elapsed = _time_ms(
+                        lambda: flash_decode(
+                            query, keys, values, self._full_len, probe,
+                            *buffers, self.scaling, splits, block_n,
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                if elapsed < best_ms:
+                    best, best_ms = (splits, block_n), elapsed
+
+        if best is not None:
+            self.splits, self.block_n = best
+            self.acc_buf, self.max_buf, self.sum_buf = self._attention_buffers(self.splits)
+            self.use_triton_attn = True
+        _log(
+            f"attention sdpa={baseline * 1000:.0f}us chosen="
+            f"{'triton ' + str(best) if best else 'sdpa'} at {best_ms * 1000:.0f}us"
+        )
+
+    def _verify_attention_fixup(self, query, keys, values, probe) -> None:
+        """Replay the single-launch attention against the two-launch form.
+
+        Same discipline as the split-K fixup: many trials across the valid
+        lengths and split counts the run can see, bit-identical or disabled.
+        """
+        if not flash_decode_module.FIXUP:
+            return
+        capacity = self._capacity
+        heads = self._batch * self.n_kv_heads
+        try:
+            plain = torch.empty_like(probe)
+            lengths = sorted({1, min(BLOCK_M + 1, capacity), max(1, capacity // 2), capacity})
+            for trial in range(48):
+                block_n = (32, 64, 128)[trial % 3]
+                ceiling = choose_splits(heads, capacity, block_n)
+                splits = max(1, ceiling >> ((trial // 3) % 3))
+                buffers = self._attention_buffers(splits)
+                length = torch.tensor(
+                    [lengths[trial % len(lengths)]], dtype=torch.int64, device=DEVICE
+                )
+                flash_decode_module.FIXUP = True
+                flash_decode(
+                    query, keys, values, length, probe, *buffers,
+                    self.scaling, splits, block_n,
+                )
+                flash_decode_module.FIXUP = False
+                flash_decode(
+                    query, keys, values, length, plain, *buffers,
+                    self.scaling, splits, block_n,
+                )
+                flash_decode_module.FIXUP = True
+                torch.cuda.synchronize()
+                if not torch.equal(probe, plain):
+                    raise RuntimeError(
+                        f"mismatch on trial {trial} splits={splits} block_n={block_n}"
+                    )
+            _log("attention fixup verified bit-identical to the two-launch combine")
+        except Exception as error:  # noqa: BLE001 - keep the proven path
+            flash_decode_module.FIXUP = False
+            _log(f"attention fixup disabled: {type(error).__name__}: {error}")
+
+    def _attention_agrees(self, query, keys, values, probe, buffers, splits, block_n) -> bool:
+        capacity = self._capacity
+        for valid in sorted({1, min(BLOCK_M + 1, capacity), max(1, capacity // 2), capacity}):
+            length = torch.tensor([valid], dtype=torch.int64, device=DEVICE)
+            flash_decode(
+                query, keys, values, length, probe, *buffers,
+                self.scaling, splits, block_n,
+            )
+            mask = (self.slots < valid).view(1, 1, 1, capacity)
+            reference = F.scaled_dot_product_attention(
+                query, keys, values, attn_mask=mask, scale=self.scaling
+            )
+            if not self._agrees(probe, reference):
+                return False
+        return True
+
+    # -------------------------------------------------------------- prefill
+
+    def _layer_prefill(self, layer, index, hidden, cos, sin):
+        attn = layer.self_attn
+        residual = hidden
+        normed = self._norm(layer.input_layernorm, hidden)
+        batch, length, _ = normed.shape
+        head_shape = (batch, length, -1, self.head_dim)
+
+        # Slicing the fused output splits a stride-1 trailing dimension, so
+        # these reshapes are views and cost nothing.
+        qkv = F.linear(normed, attn.qkv_weight)
+        q_end = self.q_size
+        k_end = q_end + self.kv_size
+        query = self._norm(attn.q_norm, qkv[..., :q_end].reshape(head_shape)).transpose(1, 2)
+        key = self._norm(attn.k_norm, qkv[..., q_end:k_end].reshape(head_shape)).transpose(1, 2)
+        value = qkv[..., k_end:].reshape(head_shape).transpose(1, 2)
+        query = (query * cos) + (_rotate_half(query) * sin)
+        key = (key * cos) + (_rotate_half(key) * sin)
+
+        self.k_cache[index][:, :, :length, :] = key
+        self.v_cache[index][:, :, :length, :] = value
+
+        # No mask plus is_causal keeps this on flash, which supports GQA.
+        attended = F.scaled_dot_product_attention(
+            query, key, value, scale=self.scaling, is_causal=True, enable_gqa=True
+        )
+        attended = attended.transpose(1, 2).reshape(batch, length, -1)
+        hidden = residual + attn.o_proj(attended)
+        return hidden + self._mlp(
+            layer, hidden, norm=layer.post_attention_layernorm
+        )
+
+    @torch.inference_mode()
+    def _prefill(self, ids: torch.Tensor) -> torch.Tensor:
+        length = ids.shape[1]
+        hidden = self.base.embed_tokens(ids)
+        cos = self.cos_table[:length].view(1, 1, length, self.head_dim)
+        sin = self.sin_table[:length].view(1, 1, length, self.head_dim)
+        for index, layer in enumerate(self.layers):
+            hidden = self._layer_prefill(layer, index, hidden, cos, sin)
+        return self.model.lm_head(self._norm(self.base.norm, hidden[:, -1:, :]))
+
+    # --------------------------------------------------------------- decode
+
+    def _layer_decode(self, layer, index, hidden, cos, sin, mask):
+        """One T=1 layer.
+
+        Query heads are laid out as [B, 8, 4, D] rather than [B, 32, 1, D]:
+        the four query heads sharing a KV head become four query *positions*
+        against eight KV heads. That is the same arithmetic, but it is plain
+        multi-head attention, so it avoids enable_gqa. In torch 2.5 GQA is
+        served only by the math and flash backends, and a mask rules out
+        flash — which would leave math expanding the cache 8 -> 32 heads with
+        repeat_interleave on every step.
+
+        At T=1 the [B,1,H,D] and [B,H,1,D] layouts are the same bytes, so the
+        reshapes below are views, not copies.
+        """
+        attn = layer.self_attn
+        residual = hidden
+        batch = hidden.shape[0]
+
+        qkv = self._fast_linear(
+            attn.qkv_weight, hidden, norm=layer.input_layernorm
+        )
+        keys, values = self.k_cache[index], self.v_cache[index]
+        head_shape = (batch, self.n_kv_heads, self.kv_groups, self.head_dim)
+
+        if self._fused_qkv:
+            query = torch.empty(head_shape, dtype=qkv.dtype, device=qkv.device)
+            qkv_finish(
+                qkv.view(batch, -1),
+                attn.q_norm.weight,
+                attn.k_norm.weight,
+                self.cos_table,
+                self.sin_table,
+                self.cur_pos,
+                query,
+                keys,
+                values,
+                attn.q_norm.variance_epsilon,
+            )
+        else:
+            q_end = self.q_size
+            k_end = q_end + self.kv_size
+            query = self._norm(
+                attn.q_norm, qkv[..., :q_end].reshape(batch, 1, -1, self.head_dim)
+            ).view(head_shape)
+            key = self._norm(
+                attn.k_norm, qkv[..., q_end:k_end].reshape(batch, 1, -1, self.head_dim)
+            ).view(batch, self.n_kv_heads, 1, self.head_dim)
+            value = qkv[..., k_end:].reshape(
+                batch, self.n_kv_heads, 1, self.head_dim
+            )
+            if self._fused_rope:
+                flat_cos = cos.view(self.head_dim)
+                flat_sin = sin.view(self.head_dim)
+                query = elementwise.rope(query, flat_cos, flat_sin)
+                key = elementwise.rope(key, flat_cos, flat_sin)
+            else:
+                query = (query * cos) + (_rotate_half(query) * sin)
+                key = (key * cos) + (_rotate_half(key) * sin)
+            keys.index_copy_(2, self.cur_pos, key)
+            values.index_copy_(2, self.cur_pos, value)
+
+        if self.use_triton_attn:
+            flash_decode(
+                query, keys, values, self.valid_len, self.attn_out,
+                self.acc_buf, self.max_buf, self.sum_buf,
+                self.scaling, self.splits, self.block_n,
+            )
+            attended = self.attn_out
+        else:
+            attended = F.scaled_dot_product_attention(
+                query, keys, values, attn_mask=mask, scale=self.scaling
+            )
+        # Group-major flatten restores head order 0..31 for o_proj.
+        attended = attended.reshape(batch, 1, -1)
+        hidden = self._fast_linear(attn.o_proj.weight, attended, residual=residual)
+        return self._mlp(
+            layer,
+            hidden,
+            fast=True,
+            residual=hidden,
+            norm=layer.post_attention_layernorm,
+        )
+
+    @torch.inference_mode()
+    def _decode_step(self) -> None:
+        """One step, driven entirely by device state and fixed buffers.
+
+        Reads cur_pos and step_token, writes next_token, then advances both, so
+        a bare graph replay is a complete step with no host work in between.
+        """
+        hidden = self.base.embed_tokens(self.step_token)
+        cos = sin = None
+        if not self._fused_qkv:
+            cos = self.cos_table.index_select(0, self.cur_pos).view(1, 1, 1, self.head_dim)
+            sin = self.sin_table.index_select(0, self.cur_pos).view(1, 1, 1, self.head_dim)
+        # The slot about to be written is live, so the count is cur_pos + 1.
+        # Capacity past it holds stale values and must never be read.
+        torch.add(self.cur_pos, 1, out=self.valid_len)
+        mask = (
+            None
+            if self.use_triton_attn
+            else (self.slots <= self.cur_pos).view(1, 1, 1, self._capacity)
+        )
+
+        for index, layer in enumerate(self.layers):
+            hidden = self._layer_decode(layer, index, hidden, cos, sin, mask)
+        logits = self._fast_linear(
+            self.model.lm_head.weight, hidden, norm=self.base.norm
+        )
+
+        self.next_token.copy_(logits[:, -1, :].argmax(dim=-1, keepdim=True))
+        self.step_token.copy_(self.next_token)
+        # Tokens accumulate on device so the host can collect a chunk of steps
+        # with a single copy instead of stalling once per step.
+        self.token_log.index_copy_(0, self.step_idx, self.next_token.view(1, -1))
+        self.step_idx.add_(1)
+        self.cur_pos.add_(1)
+
+    def _capture_prefill(self, batch: int, length: int) -> None:
+        """Capture prefill against fixed id and logit buffers.
+
+        At short prompts prefill is a few hundred launches over a few
+        milliseconds of GPU work, so the host issue rate sets the TTFT; the
+        graph removes it. Prefill only writes cache slots the real call
+        overwrites, so nothing has to be reset afterwards.
+        """
+        self.prefill_ids = torch.zeros((batch, length), dtype=torch.int64, device=DEVICE)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(CAPTURE_WARMUP_STEPS):
+                self._prefill(self.prefill_ids)
+        torch.cuda.current_stream().wait_stream(stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self.prefill_logits = self._prefill(self.prefill_ids)
+        self._prefill_graph = graph
+        self._prefill_shape = (batch, length)
+        _log(f"captured prefill graph batch={batch} prompt={length}")
+
+    def _capture(self) -> None:
+        """Capture the decode step, then wipe the state the capture dirtied.
+
+        Capture has to run the step, so it writes cache slots and moves the
+        counters; generate re-runs prefill afterwards against a clean cache.
+        """
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(CAPTURE_WARMUP_STEPS):
+                self.cur_pos.zero_()
+                self.step_token.zero_()
+                self.step_idx.zero_()
+                self._decode_step()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        self.cur_pos.zero_()
+        self.step_token.zero_()
+        self.step_idx.zero_()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._decode_step()
+
+        self._graph = graph
+        self._graph_shape = (self._batch, self._capacity)
+        for keys, values in zip(self.k_cache, self.v_cache):
+            keys.zero_()
+            values.zero_()
+        _log(
+            f"captured decode graph batch={self._batch} capacity={self._capacity} "
+            f"peak={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB"
+        )
+
+    # ------------------------------------------------------------ interface
 
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
         """Greedy continuation of every sequence, one step at a time.
 
         Yields a list with one token id per sequence for each output step,
-        exactly max_new_tokens times. Every sequence has the same length.
-        Never stops at end-of-sequence tokens.
+        exactly max_new_tokens times. Never stops at end-of-sequence tokens.
         """
+        batch = len(input_ids)
+        prompt_length = len(input_ids[0])
+        capacity = prompt_length + max_new_tokens
+
+        if not self._warmed:
+            _log(
+                f"warmup batch={batch} prompt={prompt_length} "
+                f"new={max_new_tokens} graph={USE_CUDA_GRAPH}"
+            )
+
+        if batch != self._batch or capacity != self._capacity:
+            if self._warmed:
+                _log(f"reshape mid-run to batch={batch} capacity={capacity}")
+            self._allocate(batch, capacity)
+
+        use_graph = USE_CUDA_GRAPH and max_new_tokens > 1
+        if use_graph and self._graph_shape != (batch, capacity):
+            try:
+                self._capture()
+            except Exception as error:  # noqa: BLE001 - eager still produces tokens
+                _log(f"capture failed, decoding eagerly: {type(error).__name__}: {error}")
+                self._graph = None
+                self._graph_shape = None
+                for keys, values in zip(self.k_cache, self.v_cache):
+                    keys.zero_()
+                    values.zero_()
+        use_graph = use_graph and self._graph is not None
+        if USE_CUDA_GRAPH and self._prefill_shape != (batch, prompt_length):
+            try:
+                self._capture_prefill(batch, prompt_length)
+            except Exception as error:  # noqa: BLE001 - eager prefill is exact too
+                _log(f"prefill capture failed, running eagerly: {type(error).__name__}: {error}")
+                self._prefill_graph = None
+                self._prefill_shape = None
+        self._warmed = True
+
         with torch.inference_mode():
-            if max_new_tokens <= 0:
-                return
-            current = torch.tensor(input_ids, dtype=torch.int64, device="cuda:0")
-            batch, prompt_length = current.shape
-            shape = (batch, prompt_length + max_new_tokens, max_new_tokens)
-            if shape != self.cache_shape:
-                # Release an old shape before allocating its replacement.
-                self.decoder = None
-                self.prefiller = None
-                self.cache = None
-                self.cache = PrefixCache(
-                    self.model.config, batch, shape[1], current.device,
-                    self.model.dtype,
-                )
-                self.cache_shape = shape
-            self.cache.reset()
-            if self.prefiller is None:
-                self.prefiller = PrefillGraph(self.model, self.cache, current)
-            current = self.prefiller.run(current)
-            first = current[:, 0].tolist()
-            if max_new_tokens == 1:
-                yield first
-                return
-            if self.decoder is None:
-                # Each workload supplies an untimed warmup of the same shape.
-                self.decoder = DecodeGraph(
-                    self.model, self.cache, current, prompt_length, max_new_tokens - 1,
-                )
-            self.decoder.reset(current, prompt_length)
-            # After copying a token to the host, start the next GPU step before
-            # yielding. The harness can write the host list while decode runs.
-            yield from stream_decode(self.decoder, first, max_new_tokens)
+            ids = torch.tensor(input_ids, dtype=torch.int64, device=DEVICE)
+            self.cur_pos.zero_()
+            if self._prefill_graph is not None:
+                self.prefill_ids.copy_(ids)
+                self._prefill_graph.replay()
+                logits = self.prefill_logits
+            else:
+                logits = self._prefill(ids)
+            first = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            self.step_token.copy_(first)
+            # Prefill filled slots 0..S-1; the token just chosen lands at S.
+            self.cur_pos.fill_(prompt_length)
+            self.token_log[0].copy_(first[:, 0])
+            self.step_idx.fill_(1)
+            # First token goes out immediately; time to first token is a gate.
+            yield first[:, 0].tolist()
+
+            delivered = 1
+            while delivered < max_new_tokens:
+                chunk = min(SYNC_CHUNK, max_new_tokens - delivered)
+                for _ in range(chunk):
+                    if use_graph:
+                        self._graph.replay()
+                    else:
+                        self._decode_step()
+                # One device sync for the whole chunk, then replay it to the
+                # harness a step at a time. The tokens are bit-identical; only
+                # the number of stalls changes.
+                for row in self.token_log[delivered : delivered + chunk].tolist():
+                    yield row
+                delivered += chunk
