@@ -79,7 +79,7 @@ MARGIN_LIMIT = 1.0        # native's own drift is <= 0.75; the judge's margin is
 PREFILL_TOKENS = 16384    # prefill processes at most this many tokens per row-chunk
 FORCE_TIER = int(os.environ.get("ENGINE_TIER", "5"))
 SPEC = os.environ.get("ENGINE_SPEC", "1") != "0"   # exact prompt/ngram verification; warmup-gated
-SPEC_MAX_ROWS = 64        # verify runs B*(k+1) rows through the skinny GEMMs
+SPEC_MAX_ROWS = 64        # verification GEMMs are capped at this many rows
 SPEC_CHECK_TOKENS = 128   # warmup tokens used to validate and time speculative decoding
 SPEC_MIN_GAIN = 0.92      # keep spec only if its warmup wall time is below this fraction of plain
 WARMUP_SOFT_S = 170.0     # past this many seconds since load start, skip optional warmup work
@@ -163,7 +163,10 @@ class _State:
         self.spec_T = T if (self.gemv and SPEC and N > 1 and B * T <= SPEC_MAX_ROWS
                             and time.perf_counter() - eng.t_load0 < WARMUP_SOFT_S - 60) else 0
         self.spec = False
-        Tt = 16 if B == 1 else 8
+        # Keep verification at a well-filled skinny-GEMM size across workloads.  The old fixed
+        # 16/8 policy left half the useful rows idle at B=1 and disabled trees entirely at B>=16.
+        # T=32 is also the largest tree representable by the int32 ancestor mask.
+        Tt = min(32, max(2, SPEC_MAX_ROWS // B))
         self.tree_T = Tt if ((self.fast or self.mega) and SPEC_TREE and _TREE_ERR is None and N > 1
                              and B * Tt <= SPEC_MAX_ROWS
                              and time.perf_counter() - eng.t_load0 < WARMUP_SOFT_S - 60) else 0
@@ -824,10 +827,10 @@ class Engine:
                 yield [sq[S + yielded] for sq in seqs]
                 yielded += 1
 
-    def _stream_tree(self, st, input_ids, N):
+    def _stream_tree(self, st, input_ids, N, stats=None):
         """Exact token-tree speculative decoding (NOTES.md, Phase 4 v2). Yields exactly N steps."""
         tr, B, S, T = st.tr, st.B, st.S, st.tree_T
-        maxd = min(T - 1, 8)
+        maxd = min(T - 1, 12)
         with torch.inference_mode():
             st.ids_host.copy_(torch.tensor(input_ids, dtype=torch.int64))
             st.ids.copy_(st.ids_host, non_blocking=True)
@@ -847,7 +850,10 @@ class Engine:
         drafts = [SeqDraft(sq) for sq in seqs]
         c_base, c_src, c_cnt = [S] * B, [[0] * T for _ in range(B)], [1] * B
         yielded = 1
+        passes = 0
+        accepted = []
         while yielded < N:
+            passes += 1
             trees, toks, depths, bases, ancs = [], [], [], [], []
             for b in range(B):
                 sq = seqs[b]
@@ -892,17 +898,22 @@ class Engine:
                 c_src[b] = [0] + path + [0] * (T - 1 - len(path))
                 c_cnt[b] = len(path) + 1
                 seqs[b].extend(emitted)
+                accepted.append(len(emitted))
                 drafts[b].register()
             while yielded < N and all(len(sq) - S > yielded for sq in seqs):
                 yield [sq[S + yielded] for sq in seqs]
                 yielded += 1
+        if stats is not None:
+            stats["passes"] = passes
+            stats["accepted"] = accepted
 
     def _decide_tree(self, st, input_ids, N):
         """Warmup-only: validate tree speculation on this prompt; keep it only if exact
         (teacher-forced margin <= MARGIN_LIMIT) and clearly faster than plain decode."""
         n = min(N, TREE_CHECK_TOKENS)
         try:
-            steps = list(self._stream_tree(st, input_ids, n))
+            tree_stats = {}
+            steps = list(self._stream_tree(st, input_ids, n, tree_stats))
             assert len(steps) == n and all(len(x) == st.B for x in steps)
             ours = [list(r) for r in zip(*steps)]
             margin, nonarg, _ = self._teacher_force(input_ids, ours)
@@ -915,8 +926,11 @@ class Engine:
             tree_ms = min(walls)
             plain_ms, _ = self._time_stream(st, input_ids, n)
             st.tree_on = margin <= MARGIN_LIMIT and tree_ms < TREE_MIN_GAIN * plain_ms
+            acc = tree_stats.get("accepted", [])
+            acc_desc = (f" accept_mean={sum(acc) / len(acc):.2f} accept_min={min(acc)} "
+                        f"accept_max={max(acc)} passes={tree_stats.get('passes', 0)}") if acc else ""
             log(f"tree spec T={st.tree_T}: margin={margin:.3f} non_argmax={nonarg} {n} tok: tree={tree_ms:.1f}ms "
-                f"plain={plain_ms:.1f}ms -> {'ON' if st.tree_on else 'off'}")
+                f"plain={plain_ms:.1f}ms{acc_desc} -> {'ON' if st.tree_on else 'off'}")
         except Exception as exc:
             st.tree_on = False
             log(f"tree speculation disabled: {repr(exc)[:200]}")

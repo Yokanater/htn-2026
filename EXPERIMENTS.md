@@ -138,3 +138,14 @@ plain T4 usually wins the tier comparison but cannot run token-tree verify, so
 the code never compares T5+tree against T4. Force the previously proven T5
 base for one run; tree activation remains teacher-force checked and requires
 an 8% measured warmup improvement.
+
+## 008 — Shape-adaptive exact token trees
+
+Candidate 008 keeps Candidate 007's T5 diagnostic base and widens exact tree
+verification to fill at most 64 skinny-GEMM rows: T=32 at batch 1, T=16 at
+batch 4, T=4 at batch 16, and T=2 at batch 32. The previous fixed policy used
+only 16 rows at batch 1 and disabled trees entirely at batch 16 and above.
+Maximum proposal depth rises from 8 to 12. The int32 ancestor mask still caps
+trees at 32 nodes. Warmup logs acceptance statistics and retains the tree only
+after the existing teacher-forced margin check and measured 8% speedup; plain
+T5 remains the automatic fallback.
